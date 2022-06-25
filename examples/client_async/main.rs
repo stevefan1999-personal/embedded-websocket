@@ -9,33 +9,20 @@
 // Note that we are using the standard library in the demo and making use of the framer helper module
 // but the websocket library remains no_std (see client_full for an example without the framer helper module)
 
-mod compat;
-
-use crate::compat::CompatExt;
+use embedded_io::adapters::FromTokio;
+use embedded_io::Error;
 use embedded_websocket::{
     framer::{Framer, FramerError, ReadResult},
     WebSocketClient, WebSocketCloseStatusCode, WebSocketOptions, WebSocketSendMessageType,
 };
-use std::error::Error;
+use tokio::net::TcpStream;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "example-tokio")] {
-        use tokio::net::TcpStream;
-    } else if #[cfg(feature = "example-smol")] {
-        use smol::net::TcpStream;
-    } else if #[cfg(feature = "example-async-std")] {
-        use async_std::net::TcpStream;
-    }
-}
-
-#[cfg_attr(feature = "example-async-std", async_std::main)]
-#[cfg_attr(feature = "example-tokio", tokio::main)]
-#[cfg_attr(feature = "example-smol", smol_potat::main)]
+#[tokio::main]
 async fn main() -> Result<(), FramerError<impl Error>> {
     // open a TCP stream to localhost port 1337
     let address = "127.0.0.1:1337";
     println!("Connecting to: {}", address);
-    let mut stream = TcpStream::connect(address).await.map_err(FramerError::Io)?;
+    let stream = TcpStream::connect(address).await.map_err(FramerError::Io)?;
     println!("Connected.");
 
     let mut read_buf = [0; 4000];
@@ -59,7 +46,7 @@ async fn main() -> Result<(), FramerError<impl Error>> {
         &mut write_buf,
         &mut websocket,
     );
-    let mut stream = stream.compat_mut();
+    let mut stream = FromTokio::new(stream);
 
     framer
         .connect_async(&mut stream, &websocket_options)

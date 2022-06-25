@@ -9,17 +9,20 @@
 // Note that we are using the standard library in the demo and making use of the framer helper module
 // but the websocket library remains no_std (see client_full for an example without the framer helper module)
 
+use embedded_io::adapters::FromStd;
+use embedded_io::Error;
 use embedded_websocket::{
     framer::{Framer, FramerError, ReadResult},
     WebSocketClient, WebSocketCloseStatusCode, WebSocketOptions, WebSocketSendMessageType,
 };
-use std::{error::Error, net::TcpStream};
+use std::net::TcpStream;
 
 fn main() -> Result<(), FramerError<impl Error>> {
     // open a TCP stream to localhost port 1337
     let address = "127.0.0.1:1337";
     println!("Connecting to: {}", address);
-    let mut stream = TcpStream::connect(address).map_err(FramerError::Io)?;
+    let stream = TcpStream::connect(address).map_err(FramerError::Io)?;
+    let mut stream = FromStd::new(stream);
     println!("Connected.");
 
     let mut read_buf = [0; 4000];

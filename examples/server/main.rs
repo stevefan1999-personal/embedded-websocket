@@ -8,6 +8,7 @@
 // the client as well as responding to any opening and closing handshakes.
 // Note that we are using the standard library in the demo but the websocket library remains no_std
 
+use embedded_io::adapters::FromStd;
 use embedded_websocket as ws;
 use httparse::Request;
 use once_cell::sync::Lazy;
@@ -98,6 +99,8 @@ static ROUTER: Lazy<Router<Handler>> = Lazy::new(|| {
 fn handle_chat(stream: &mut TcpStream, req: &Request) -> Result<()> {
     println!("Received chat request: {:?}", req.path);
 
+    let mut stream = FromStd::new(stream);
+
     if let Some(websocket_context) =
         ws::read_http_header(req.headers.iter().map(|f| (f.name, f.value)))?
     {
@@ -115,16 +118,16 @@ fn handle_chat(stream: &mut TcpStream, req: &Request) -> Result<()> {
         );
 
         // complete the opening handshake with the client
-        framer.accept(stream, &websocket_context)?;
+        framer.accept(&mut stream, &websocket_context)?;
         println!("Websocket connection opened");
 
         // read websocket frames
-        while let ReadResult::Text(text) = framer.read(stream, &mut frame_buf)? {
+        while let ReadResult::Text(text) = framer.read(&mut stream, &mut frame_buf)? {
             println!("Received: {}", text);
 
             // send the text back to the client
             framer.write(
-                stream,
+                &mut stream,
                 WebSocketSendMessageType::Text,
                 true,
                 format!("hello {}", text).as_bytes(),

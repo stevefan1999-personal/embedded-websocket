@@ -8,15 +8,20 @@
 // the client as well as responding to any opening and closing handshakes.
 // Note that we are using the standard library in the demo but the websocket library remains no_std
 
-mod compat;
+#![feature(core_intrinsics)]
 
-use crate::compat::CompatExt;
-use async_trait::async_trait;
+use embedded_io::{adapters::FromTokio, asynch::Read as AsyncRead, asynch::Write as AsyncWrite};
+use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, TlsError};
 use embedded_websocket as ws;
 use httparse::Request;
 use once_cell::sync::Lazy;
+use rand_core::OsRng;
 use route_recognizer::Router;
+use std::io;
 use std::str::Utf8Error;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::runtime::Runtime;
+use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 use ws::{
     framer::{Framer, FramerError, ReadResult},
     WebSocketSendMessageType, WebSocketServer,
@@ -24,47 +29,37 @@ use ws::{
 
 type Result<T> = std::result::Result<T, WebServerError>;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "example-tokio")] {
-        use tokio::{
-            io::{AsyncReadExt, AsyncWriteExt},
-            net::{TcpListener, TcpStream},
-        };
-        use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
-    } else if #[cfg(feature = "example-smol")] {
-        use smol::{
-            io::{AsyncReadExt, AsyncWriteExt},
-            net::{TcpListener, TcpStream},
-            stream::StreamExt,
-        };
-    } else if #[cfg(feature = "example-async-std")] {
-        use async_std::{
-            io::{ReadExt as AsyncReadExt, WriteExt as AsyncWriteExt},
-            net::{TcpListener, TcpStream},
-            stream::StreamExt,
-        };
-    }
-}
-
 #[derive(Debug)]
 pub enum WebServerError {
-    Io(std::io::Error),
-    Framer(FramerError<std::io::Error>),
+    Io(io::Error),
+    Framer(FramerError<io::Error>),
     WebSocket(ws::Error),
     HttpError(httparse::Error),
     Utf8Error,
+    TlsError(TlsError),
     Custom(String),
 }
 
-impl From<std::io::Error> for WebServerError {
-    fn from(err: std::io::Error) -> WebServerError {
+fn to_io_error<T: core::fmt::Debug>(err: T) -> io::Error {
+    let kind = io::ErrorKind::Other;
+    io::Error::new(kind, format!("{:?}", err))
+}
+
+impl From<io::Error> for WebServerError {
+    fn from(err: io::Error) -> WebServerError {
         WebServerError::Io(err)
     }
 }
 
-impl From<FramerError<std::io::Error>> for WebServerError {
-    fn from(err: FramerError<std::io::Error>) -> WebServerError {
+impl From<FramerError<io::Error>> for WebServerError {
+    fn from(err: FramerError<io::Error>) -> WebServerError {
         WebServerError::Framer(err)
+    }
+}
+
+impl From<FramerError<TlsError>> for WebServerError {
+    fn from(err: FramerError<TlsError>) -> WebServerError {
+        WebServerError::Framer(FramerError::Io(to_io_error(err)))
     }
 }
 
@@ -80,16 +75,26 @@ impl From<Utf8Error> for WebServerError {
     }
 }
 
+impl From<TlsError> for WebServerError {
+    fn from(err: TlsError) -> WebServerError {
+        WebServerError::TlsError(err)
+    }
+}
+
 impl From<httparse::Error> for WebServerError {
     fn from(err: httparse::Error) -> WebServerError {
         WebServerError::HttpError(err)
     }
 }
 
-#[cfg_attr(feature = "example-async-std", async_std::main)]
-#[cfg_attr(feature = "example-tokio", tokio::main)]
-#[cfg_attr(feature = "example-smol", smol_potat::main)]
-async fn main() -> std::io::Result<()> {
+// type TlsStream<'a> = TlsConnection<'a, FromTokio<TcpStream>, Aes128GcmSha256>;
+
+type TlsStream = FromTokio<TcpStream>;
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    // SimpleLogger::new().init().unwrap();
+
     let addr = "127.0.0.1:1337";
     let listener = TcpListener::bind(addr).await?;
     println!("Listening on: {}", addr);
@@ -107,21 +112,35 @@ async fn main() -> std::io::Result<()> {
     while let Some(stream) = incoming.next().await {
         match stream {
             Ok(stream) => {
-                let fut = async {
-                    match handle_client(stream).await {
+                let fut = || async {
+                    println!("Client connected {:?}", stream.peer_addr());
+                    let stream = FromTokio::new(stream);
+
+                    // let mut record_buffer = [0; 16384];
+                    // let config = TlsConfig::new()
+                    //     .with_server_name("localhost")
+                    //     .verify_hostname(false)
+                    //     .verify_cert(false);
+                    // let mut rng = OsRng;
+                    // let mut tls = TlsConnection::new(stream, &mut record_buffer);
+                    //
+                    // let context = TlsContext::new(&config, &mut rng);
+                    // tls.open::<OsRng, std::time::SystemTime, 4096>(context)
+                    //     .await
+                    //     .map_err(to_io_error)?;
+
+                    handle_client(stream).await
+                };
+
+                tokio::task::spawn_blocking(move || {
+                    let local = tokio::task::LocalSet::new();
+                    let mut rt = Runtime::new().unwrap();
+
+                    match local.block_on(&mut rt, fut()) {
                         Ok(()) => println!("Connection closed"),
                         Err(e) => println!("Error: {:?}", e),
                     }
-                };
-
-                #[cfg(feature = "example-async-std")]
-                async_std::task::spawn(fut);
-
-                #[cfg(feature = "example-smol")]
-                smol::spawn(fut).detach();
-
-                #[cfg(feature = "example-tokio")]
-                tokio::spawn(fut);
+                });
             }
             Err(e) => println!("Failed to establish a connection: {}", e),
         }
@@ -130,103 +149,84 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-type Handler = Box<dyn SimpleHandler + Send + Sync>;
-
-static ROUTER: Lazy<Router<Handler>> = Lazy::new(|| {
+static ROUTER: Lazy<Router<&'static str>> = Lazy::new(|| {
     let mut router = Router::new();
-    router.add("/chat", Box::new(Chat) as Handler);
-    router.add("/", Box::new(Root) as Handler);
+    router.add("/chat", "/chat");
+    router.add("/", "/");
     router
 });
 
-#[async_trait]
-trait SimpleHandler {
-    async fn handle(&self, stream: &mut TcpStream, req: &Request<'_, '_>) -> Result<()>;
-}
-
-struct Chat;
-
-#[async_trait]
-impl SimpleHandler for Chat {
-    async fn handle(&self, stream: &mut TcpStream, req: &Request<'_, '_>) -> Result<()> {
-        println!("Received chat request: {:?}", req.path);
-
-        if let Some(websocket_context) =
-            ws::read_http_header(req.headers.iter().map(|f| (f.name, f.value)))?
-        {
-            // this is a websocket upgrade HTTP request
-            let mut read_buf = [0; 4000];
-            let mut read_cursor = 0;
-            let mut write_buf = [0; 4000];
-            let mut frame_buf = [0; 4000];
-            let mut websocket = WebSocketServer::new_server();
-            let mut framer = Framer::new(
-                &mut read_buf,
-                &mut read_cursor,
-                &mut write_buf,
-                &mut websocket,
-            );
-
-            // complete the opening handshake with the client
-            let mut stream = stream.compat_mut();
-            framer.accept_async(&mut stream, &websocket_context).await?;
-            println!("Websocket connection opened");
-
-            // read websocket frames
-            while let ReadResult::Text(text) =
-                framer.read_async(&mut stream, &mut frame_buf).await?
-            {
-                println!("Received: {}", text);
-
-                // send the text back to the client
-                framer
-                    .write_async(
-                        &mut stream,
-                        WebSocketSendMessageType::Text,
-                        true,
-                        format!("hello {}", text).as_bytes(),
-                    )
-                    .await?
-            }
-
-            println!("Closing websocket connection");
-        }
-
-        Ok(())
-    }
-}
-
-struct Root;
-
-#[async_trait]
-impl SimpleHandler for Root {
-    async fn handle(&self, stream: &mut TcpStream, _req: &Request<'_, '_>) -> Result<()> {
-        stream.write_all(&ROOT_HTML.as_bytes()).await?;
-        Ok(())
-    }
-}
-
-async fn handle_client(mut stream: TcpStream) -> Result<()> {
-    println!("Client connected {}", stream.peer_addr()?);
+async fn handle_client(mut stream: TlsStream) -> Result<()> {
     let mut read_buf = [0; 4000];
     let mut read_cursor = 0;
 
-    let mut headers = vec![httparse::EMPTY_HEADER; 8];
+    let mut headers = [httparse::EMPTY_HEADER; 32];
     let received_size = stream.read(&mut read_buf[read_cursor..]).await?;
     let request = loop {
         let mut request = Request::new(&mut headers);
         match request.parse(&read_buf[..read_cursor + received_size]) {
             Ok(httparse::Status::Partial) => read_cursor += received_size,
             Ok(httparse::Status::Complete(_)) => break request,
-            Err(httparse::Error::TooManyHeaders) => {
-                headers.resize(headers.len() * 2, httparse::EMPTY_HEADER)
-            }
+            // Err(httparse::Error::TooManyHeaders) => {
+            //     headers = headers.resize(headers.len() * 2, httparse::EMPTY_HEADER)
+            // }
             Err(e) => return Err(e.into()),
         }
     };
 
     match ROUTER.recognize(request.path.unwrap_or("/")) {
-        Ok(handler) => handler.handler().handle(&mut stream, &request).await,
+        Ok(handler) => match **handler.handler() {
+            "/chat" => {
+                println!("Received chat request: {:?}", request.path);
+
+                if let Some(websocket_context) =
+                    ws::read_http_header(request.headers.iter().map(|f| (f.name, f.value)))?
+                {
+                    // this is a websocket upgrade HTTP request
+                    let mut read_buf = [0; 4000];
+                    let mut read_cursor = 0;
+                    let mut write_buf = [0; 4000];
+                    let mut frame_buf = [0; 4000];
+                    let mut websocket = WebSocketServer::new_server();
+                    let mut framer = Framer::new(
+                        &mut read_buf,
+                        &mut read_cursor,
+                        &mut write_buf,
+                        &mut websocket,
+                    );
+
+                    // complete the opening handshake with the client
+                    framer.accept_async(&mut stream, &websocket_context).await?;
+                    println!("Websocket connection opened");
+
+                    // read websocket frames
+                    while let ReadResult::Text(text) =
+                        framer.read_async(&mut stream, &mut frame_buf).await?
+                    {
+                        println!("Received: {}", text);
+
+                        // send the text back to the client
+                        framer
+                            .write_async(
+                                &mut stream,
+                                WebSocketSendMessageType::Text,
+                                true,
+                                format!("hello {}", text).as_bytes(),
+                            )
+                            .await?
+                    }
+
+                    println!("Closing websocket connection");
+                }
+
+                Ok(())
+            }
+            "/" => {
+                stream.write_all(&ROOT_HTML.as_bytes()).await?;
+                Ok(())
+            }
+            _ => unreachable!(),
+        },
         Err(e) => {
             println!("Unknown path: {:?}", request.path);
             let html = format!(
